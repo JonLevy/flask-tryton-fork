@@ -20,7 +20,7 @@ __all__ = ['Tryton', 'tryton_transaction']
 from trytond.transaction import Transaction
 from contextlib import contextmanager
 @contextmanager
-def conditional_transaction_for_tests(*args, **kwargs):
+def conditional_transaction_for_tests(database, user, readonly=True, context=None):
     """
     Start a new transaction, unless in the context of tests, and
     transaction is already running.
@@ -30,7 +30,9 @@ def conditional_transaction_for_tests(*args, **kwargs):
         not Transaction().user  # test if started
     )
     if need_new_transaction:
-        with Transaction().start(database, user, readonly=True) as transaction:
+        with Transaction().start(
+                database, user, readonly=readonly, context=context
+        ) as transaction:
             yield transaction
     else:
         @contextmanager
