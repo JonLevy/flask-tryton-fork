@@ -1,0 +1,31 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^topic\/.*/ && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - when: always
+
+stages:
+  - check
+  - test
+
+.check:
+  stage: check
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/tryton/ci
+
+check-flake8:
+  extends: .check
+  script:
+    - flake8
+
+check-isort:
+  extends: .check
+  script:
+    - isort --multi-line VERTICAL_GRID --check --diff .
+
+check-dist:
+  extends: .check
+  before_script:
+    - pip install twine
+  script:
+    - python setup.py sdist
+    - twine check dist/*
