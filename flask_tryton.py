@@ -16,6 +16,33 @@ __version__ = '0.11.3'
 __all__ = ['Tryton', 'tryton_transaction']
 
 
+# Start jsl patch
+from trytond.transaction import Transaction
+from contextlib import contextmanager
+@contextmanager
+def conditional_transaction_for_tests(*args, **kwargs):
+    """
+    Start a new transaction, unless in the context of tests, and
+    transaction is already running.
+    """
+    need_new_transaction = (
+        not config.get('web', 'testing_flask') or
+        not Transaction().user  # test if started
+    )
+    if need_new_transaction:
+        with Transaction().start(database, user, readonly=True) as transaction:
+            yield transaction
+    else:
+        @contextmanager
+        def dummy_manager():
+            yield Transaction()
+
+        with dummy_manager() as dummy:
+            yield dummy
+# end jsl patch
+
+
+
 def retry_transaction(func):
     """Decorator to retry a transaction if failed. The decorated method
     will be run retry times in case of DatabaseOperationalError.
@@ -63,7 +90,7 @@ class Tryton(object):
 
         self.database_retry = config.getint('database', 'retry')
         self.pool = Pool(database)
-        with Transaction().start(database, user, readonly=True):
+        with conditional_transaction_for_tests(database, user, readonly=True): #jsl
             self.pool.init()
 
         if not hasattr(app, 'extensions'):
@@ -164,7 +191,8 @@ class Tryton(object):
                 tryton = current_app.extensions['Tryton']
                 database = current_app.config['TRYTON_DATABASE']
                 if (5, 1) > trytond_version:
-                    with Transaction().start(database, 0):
+                    #jsl
+                    with conditional_transaction_for_tests(database, 0):
                         Cache.clean(database)
                 if user is None:
                     transaction_user = get_value(
@@ -179,8 +207,10 @@ class Tryton(object):
 
                 transaction_context = {}
                 if tryton.context_callback or context:
-                    with Transaction().start(database, transaction_user,
-                            readonly=True):
+                    #jsl
+                    with conditional_transaction_for_tests(
+                        database, transaction_user, readonly=True
+                    ):
                         if tryton.context_callback:
                             transaction_context = tryton.context_callback()
                         transaction_context.update(get_value(context) or {})
@@ -192,9 +222,11 @@ class Tryton(object):
                         'is_secure': request.is_secure,
                         } if request else {})
 
-                with Transaction().start(database, transaction_user,
-                        readonly=is_readonly,
-                        context=transaction_context) as transaction:
+                #jsl
+                with conditional_transaction_for_tests(
+                    database, transaction_user, readonly=is_readonly,
+                    context=transaction_context
+                ) as transaction:
                     try:
                         result = func(*map(instanciate, args),
                             **dict((n, instanciate(v))
