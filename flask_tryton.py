@@ -1,73 +1,20 @@
 # This file is part of flask_tryton.  The COPYRIGHT file at the top level of
 # this repository contains the full copyright notices and license terms.
 
+import time
+from contextlib import contextmanager
 from functools import wraps
+from unittest.mock import MagicMock
 
 from flask import current_app, request
 from werkzeug.exceptions import BadRequest
 from werkzeug.routing import BaseConverter
 
-from trytond import __version__ as trytond_version
 from trytond.config import config
 from trytond.exceptions import ConcurrencyException, UserError, UserWarning
 
-trytond_version = tuple(map(int, trytond_version.split('.')))
-__version__ = '0.11.3'
+__version__ = '0.12.3'
 __all__ = ['Tryton', 'tryton_transaction']
-
-
-# Start jsl patch
-from trytond.transaction import Transaction
-from contextlib import contextmanager
-@contextmanager
-def conditional_transaction_for_tests(database, user, readonly=True, context=None):
-    """
-    Start a new transaction, unless in the context of tests, and
-    transaction is already running.
-    """
-    need_new_transaction = (
-        not config.get('web', 'testing_flask') or
-        not Transaction().user  # test if started
-    )
-    if need_new_transaction:
-        with Transaction().start(
-                database, user, readonly=readonly, context=context
-        ) as transaction:
-            yield transaction
-    else:
-        @contextmanager
-        def dummy_manager():
-            yield Transaction()
-
-        with dummy_manager() as dummy:
-            yield dummy
-# end jsl patch
-
-
-
-def retry_transaction(func):
-    """Decorator to retry a transaction if failed. The decorated method
-    will be run retry times in case of DatabaseOperationalError.
-    """
-    from trytond import backend
-    from trytond.transaction import Transaction
-    try:
-        DatabaseOperationalError = backend.DatabaseOperationalError
-    except AttributeError:
-        DatabaseOperationalError = backend.get('DatabaseOperationalError')
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        tryton = current_app.extensions['Tryton']
-        retry = tryton.database_retry
-        for count in range(retry, -1, -1):
-            try:
-                return func(*args, **kwargs)
-            except DatabaseOperationalError:
-                if count and not Transaction().readonly:
-                    continue
-                raise
-    return wrapper
 
 
 class Tryton(object):
@@ -82,18 +29,21 @@ class Tryton(object):
     def init_app(self, app):
         "Initialize an application for the use with this Tryton setup."
         database = app.config.setdefault('TRYTON_DATABASE', None)
-        user = app.config.setdefault('TRYTON_USER', 0)
+        app.config.setdefault('TRYTON_USER', 0)
         configfile = app.config.setdefault('TRYTON_CONFIG', None)
 
         config.update_etc(configfile)
 
         from trytond.pool import Pool
-        from trytond.transaction import Transaction
+
+        Pool.stop = classmethod(lambda cls, database_name: None)  # Freeze pool
 
         self.database_retry = config.getint('database', 'retry')
+        database_list = Pool.database_list()
         self.pool = Pool(database)
-        with conditional_transaction_for_tests(database, user, readonly=True): #jsl
-            self.pool.init()
+        if database not in database_list:
+            with _transaction_start(database, 0, readonly=True):
+                self.pool.init()
 
         if not hasattr(app, 'extensions'):
             app.extensions = {}
@@ -171,8 +121,12 @@ class Tryton(object):
         readonly, user and context can also be callable.
         """
         from trytond import backend
-        from trytond.cache import Cache
         from trytond.transaction import Transaction
+        try:
+            from trytond.transaction import TransactionError
+        except ImportError:
+            class TransactionError(Exception):
+                pass
         try:
             DatabaseOperationalError = backend.DatabaseOperationalError
         except AttributeError:
@@ -187,15 +141,10 @@ class Tryton(object):
             return value
 
         def decorator(func):
-            @retry_transaction
             @wraps(func)
             def wrapper(*args, **kwargs):
                 tryton = current_app.extensions['Tryton']
                 database = current_app.config['TRYTON_DATABASE']
-                if (5, 1) > trytond_version:
-                    #jsl
-                    with conditional_transaction_for_tests(database, 0):
-                        Cache.clean(database)
                 if user is None:
                     transaction_user = get_value(
                         int(current_app.config['TRYTON_USER']))
@@ -209,10 +158,8 @@ class Tryton(object):
 
                 transaction_context = {}
                 if tryton.context_callback or context:
-                    #jsl
-                    with conditional_transaction_for_tests(
-                        database, transaction_user, readonly=True
-                    ):
+                    with _transaction_start(
+                            database, transaction_user, readonly=True):
                         if tryton.context_callback:
                             transaction_context = tryton.context_callback()
                         transaction_context.update(get_value(context) or {})
@@ -224,39 +171,77 @@ class Tryton(object):
                         'is_secure': request.is_secure,
                         } if request else {})
 
-                #jsl
-                with conditional_transaction_for_tests(
-                    database, transaction_user, readonly=is_readonly,
-                    context=transaction_context
-                ) as transaction:
-                    try:
-                        result = func(*map(instanciate, args),
-                            **dict((n, instanciate(v))
-                                for n, v in kwargs.items()))
-                        if (hasattr(transaction, 'cursor')
-                                and not is_readonly):
-                            transaction.cursor.commit()
-                    except DatabaseOperationalError:
-                        raise
-                    except Exception as e:
-                        if isinstance(e, (
-                                    UserError,
-                                    UserWarning,
-                                    ConcurrencyException)):
+                retry = tryton.database_retry
+                count = 0
+                transaction_extras = {}
+                while True:
+                    if count:
+                        time.sleep(0.02 * count)
+                    with _transaction_start(
+                            database, transaction_user,
+                            readonly=is_readonly,
+                            context=transaction_context,
+                            **transaction_extras) as transaction:
+                        try:
+                            result = func(*map(instanciate, args),
+                                **dict((n, instanciate(v))
+                                    for n, v in kwargs.items()))
+                        except TransactionError as e:
+                            if transaction != Transaction():
+                                raise
+                            transaction.rollback()
+                            transaction.tasks.clear()
+                            e.fix(transaction_extras)
+                            continue
+                        except DatabaseOperationalError:
+                            if transaction != Transaction():
+                                raise
+                            if count < retry and not transaction.readonly:
+                                transaction.rollback()
+                                transaction.tasks.clear()
+                                count += 1
+                                continue
+                            raise
+                        except (
+                                UserError,
+                                UserWarning,
+                                ConcurrencyException) as e:
                             raise BadRequest(e.message)
-                        raise
-                    if (5, 1) > trytond_version:
-                        Cache.resets(database)
-                from trytond.worker import run_task
-                while transaction.tasks:
-                    task_id = transaction.tasks.pop()
-                    run_task(tryton.pool, task_id)
-                return result
+                    from trytond.worker import run_task
+                    while transaction.tasks:
+                        task_id = transaction.tasks.pop()
+                        run_task(tryton.pool, task_id)
+                    return result
             return wrapper
         return decorator
 
 
 tryton_transaction = Tryton.transaction
+
+
+@contextmanager
+def _transaction_start(database, user, readonly=False, context=None, **kwargs):
+    from trytond.transaction import Transaction
+    transaction = Transaction()
+    if transaction.database is None:
+        with transaction.start(
+                database, user, readonly=readonly, context=context,
+                **kwargs) as transaction:
+            yield transaction
+    else:
+        assert transaction.database.name == database
+        previous_readonly = readonly
+        with transaction.set_user(user), \
+                transaction.reset_context(), \
+                transaction.set_context(context):
+            transaction.readonly = readonly
+            mock = MagicMock(spec=Transaction)()
+            mock.readonly = readonly
+            mock.tasks = []
+            try:
+                yield mock
+            finally:
+                transaction.readonly = previous_readonly
 
 
 class _BaseProxy(object):
