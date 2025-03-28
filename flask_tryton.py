@@ -1,6 +1,8 @@
 # This file is part of flask_tryton.  The COPYRIGHT file at the top level of
 # this repository contains the full copyright notices and license terms.
 
+import logging
+
 import time
 from contextlib import contextmanager
 from functools import wraps
@@ -15,6 +17,8 @@ from trytond.exceptions import ConcurrencyException, UserError, UserWarning
 
 __version__ = '0.12.3'
 __all__ = ['Tryton', 'tryton_transaction']
+
+logger = logging.getLogger(__name__)
 
 
 class Tryton(object):
@@ -206,6 +210,7 @@ class Tryton(object):
                                 UserError,
                                 UserWarning,
                                 ConcurrencyException) as e:
+                            logger.error('jsljsl ' + e.message)
                             raise BadRequest(e.message)
                     from trytond.worker import run_task
                     while transaction.tasks:
